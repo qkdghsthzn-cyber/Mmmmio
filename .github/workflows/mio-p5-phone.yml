@@ -28,7 +28,7 @@ jobs:
           from pathlib import Path, PurePosixPath
           
           archive = Path("MIO_P5_Build_Sources.zip")
-          expected = "feb53d33ffe39372cd88cd7b4c81294e0a40e6ec9c9989205c3501634e6a18fe"
+          expected = "bdfcd5569cfea8fb0ab72188b12cdf4b8f30953ddf3c3c12213b46b9f5ffc7f8"
           if not archive.is_file():
               raise RuntimeError("Upload MIO_P5_Build_Sources.zip to the repository root first")
           if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
@@ -106,9 +106,9 @@ jobs:
           from pathlib import Path
           phases = "P0 P1 P2 P3 P4 P5_contract P5_recovery P5_http P5_runtime P5_hourly P5_effects P5_clock P5_restore P5_month P5_disaster P5_mobile P5_host_resume P5_oauth P5_android_dependencies".split()
           reports = [json.loads(Path(f"reports/{phase}_tests.json").read_text()) for phase in phases]
-          if any(report["status"] != "PASS" for report in reports) or sum(report["test_count"] for report in reports) != 378:
-              raise RuntimeError("All 378 fixture tests must pass before building the APK")
-          print("378 fixture tests PASS; these are not Android device tests")
+          if any(report["status"] != "PASS" for report in reports) or sum(report["test_count"] for report in reports) != 379:
+              raise RuntimeError("All 379 fixture tests must pass before building the APK")
+          print("379 fixture tests PASS; these are not Android device tests")
           PY
       - name: Build original P5 Android probe
         id: android_build
