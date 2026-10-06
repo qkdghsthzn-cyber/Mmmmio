@@ -1,0 +1,168 @@
+name: MIO P5 phone build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mio-p5-phone-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source ZIP
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify and extract provided source ZIP
+        id: source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, stat, zipfile
+          from pathlib import Path, PurePosixPath
+          
+          archive = Path("MIO_P5_Build_Sources.zip")
+          expected = "feb53d33ffe39372cd88cd7b4c81294e0a40e6ec9c9989205c3501634e6a18fe"
+          if not archive.is_file():
+              raise RuntimeError("Upload MIO_P5_Build_Sources.zip to the repository root first")
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+              raise RuntimeError("Source ZIP checksum mismatch: upload the matching provided source ZIP")
+          destination = Path(os.environ["RUNNER_TEMP"]) / "mio-p5-source"
+          destination.mkdir()
+          with zipfile.ZipFile(archive) as bundle:
+              if bundle.testzip() is not None:
+                  raise RuntimeError("Source ZIP integrity failed")
+              names = bundle.namelist()
+              if len(names) != len(set(names)):
+                  raise RuntimeError("Duplicate ZIP paths")
+              for member in bundle.infolist():
+                  name = PurePosixPath(member.filename)
+                  if name.is_absolute() or ".." in name.parts or chr(92) in member.filename:
+                      raise RuntimeError("Unsafe ZIP path")
+                  if stat.S_ISLNK(member.external_attr >> 16):
+                      raise RuntimeError("ZIP symlinks are not allowed")
+                  if not destination.joinpath(*name.parts).resolve().is_relative_to(destination.resolve()):
+                      raise RuntimeError("ZIP path escapes destination")
+              manifest = json.loads(bundle.read("build_source_manifest.json"))
+              if manifest.get("format") != "mio-code-only-build-v1":
+                  raise RuntimeError("Unknown build source format")
+              listed = [entry["path"] for entry in manifest["files"]]
+              if len(listed) != len(set(listed)) or set(names) != set(listed) | {"build_source_manifest.json"}:
+                  raise RuntimeError("Incomplete source manifest")
+              for entry in manifest["files"]:
+                  if hashlib.sha256(bundle.read(entry["path"])).hexdigest() != entry["sha256"]:
+                      raise RuntimeError("Source file checksum mismatch")
+              if len([name for name in names if name.startswith("data/event_families/")]) != 160:
+                  raise RuntimeError("All 160 original Family files must be included")
+              if "reference/01_Core_Identity.md" not in names:
+                  raise RuntimeError("Required runtime Core Identity is missing")
+              bundle.extractall(destination)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("root=" + str(destination) + "\n")
+          print(f"Verified and extracted {len(names)} source files; Android build has not run yet")
+          PY
+      - name: Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.13'
+          cache-provider: basic
+          cache-disabled: true
+          build-scan-publish: false
+      - name: Android SDK packages
+        shell: bash
+        run: |
+          mio_sdkmanager="$(command -v sdkmanager || true)"
+          if [[ -z "$mio_sdkmanager" ]]; then
+            mio_sdkmanager="${ANDROID_HOME:?Android SDK is missing}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          (yes || true) | "$mio_sdkmanager" --licenses > "$RUNNER_TEMP/mio-sdk-licenses.log"
+          "$mio_sdkmanager" 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Full fixture regression in phase order
+        working-directory: ${{ steps.source.outputs.root }}
+        run: |
+          python -m pip install -r requirements.txt -c android-probe/constraints.txt
+          python tools/test_report.py P0 P1 P2 P3 P4 P5_contract P5_recovery P5_http P5_runtime P5_hourly P5_effects P5_clock P5_restore P5_month P5_disaster P5_mobile P5_host_resume P5_oauth P5_android_dependencies
+      - name: Verify fixture acceptance before APK build
+        working-directory: ${{ steps.source.outputs.root }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          phases = "P0 P1 P2 P3 P4 P5_contract P5_recovery P5_http P5_runtime P5_hourly P5_effects P5_clock P5_restore P5_month P5_disaster P5_mobile P5_host_resume P5_oauth P5_android_dependencies".split()
+          reports = [json.loads(Path(f"reports/{phase}_tests.json").read_text()) for phase in phases]
+          if any(report["status"] != "PASS" for report in reports) or sum(report["test_count"] for report in reports) != 378:
+              raise RuntimeError("All 378 fixture tests must pass before building the APK")
+          print("378 fixture tests PASS; these are not Android device tests")
+          PY
+      - name: Build original P5 Android probe
+        id: android_build
+        working-directory: ${{ steps.source.outputs.root }}
+        run: python tools/build_android_probe.py
+      - name: Show Android build error log
+        if: ${{ always() && steps.android_build.outcome == 'failure' }}
+        shell: bash
+        run: |
+          for mio_build_log in "$RUNNER_TEMP/mio-p5-source/reports/P5_android_wheels.log" "$RUNNER_TEMP/mio-p5-source/reports/P5_android_build.log"; do
+            if [[ -f "$mio_build_log" ]]; then
+              echo "Last 200 lines: $mio_build_log"
+              tail -n 200 -- "$mio_build_log"
+            else
+              echo "Log not created: $mio_build_log"
+            fi
+          done
+      - name: Verify and collect APK
+        working-directory: ${{ steps.source.outputs.root }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          report = json.loads(Path("reports/P5_android_build.json").read_text())
+          apk = Path("android-probe/probe/build/outputs/apk/debug/probe-debug.apk")
+          if report.get("status") != "APK_BUILT_DEVICE_NOT_RUN" or not report.get("apk_built") or not apk.is_file():
+              raise RuntimeError("No validated APK was produced")
+          if hashlib.sha256(apk.read_bytes()).hexdigest() != report["apk_sha256"]:
+              raise RuntimeError("APK checksum mismatch")
+          destination = Path(os.environ["RUNNER_TEMP"]) / "mio-p5-apk"
+          destination.mkdir()
+          shutil.copy2(apk, destination / "MIO_P5_Device_Probe.apk")
+          print("P5 qualification APK built; real phone execution NOT_RUN")
+          PY
+      - name: Downloadable APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: MIO_P5_Device_Probe
+          path: ${{ runner.temp }}/mio-p5-apk/MIO_P5_Device_Probe.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MIO_P5_build_diagnostics
+          path: |
+            ${{ runner.temp }}/mio-p5-source/reports/*_tests.json
+            ${{ runner.temp }}/mio-p5-source/reports/P5_android_build.json
+            ${{ runner.temp }}/mio-p5-source/reports/P5_android_build.log
+            ${{ runner.temp }}/mio-p5-source/reports/P5_android_wheels.json
+            ${{ runner.temp }}/mio-p5-source/reports/P5_android_wheels.log
+            ${{ runner.temp }}/mio-sdk-licenses.log
+          if-no-files-found: warn
+          retention-days: 7
